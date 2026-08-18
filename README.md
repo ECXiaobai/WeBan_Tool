@@ -1,0 +1,161 @@
+# _WeBan_ 安全微课 安全微伴 大学安全教育
+
+## 介绍
+
+如果本项目帮到了你，可以在右上角点亮 Star，谢谢你！
+
+实现了课程学习和根据题库自动考试，支持多用户多线程运行，自动验证码识别等。
+
+运行前后会自动合并题库，如果一次没满分可以再考一次。可将 `answer/answer.json` 文件提交 PR 一起完善题库。
+
+## 功能特性
+
+- **课程学习**：自动遍历项目 → 分类 → 课程，模拟翻页、答题、等待学习时长后完课
+- **自动考试**：基于题库自动答题，支持单选/多选，未匹配题目可随机作答或手动输入
+- **验证码识别**：自动识别滑块验证码（需源码运行 + ddddocr），腾讯点选验证码需手动操作
+- **多账号并发**：支持配置多个账号，可多线程同时执行
+- **题库同步**：考试前后自动从服务器同步题库，支持多用户共享
+- **断点续考**：追求满分模式下，一次未满分可再次考试
+- **进度监控**：完课后自动检查进度是否更新，未更新则警告提示
+- **调试模式**：开启 `debug` 可查看完整请求/响应日志
+
+## 使用
+
+从下面的几种方式下载后运行，配置说明可参考 [config.example.toml](config.example.toml)，账号级配置可覆盖全局设置。
+
+### 构建产物
+
+从 [Releases](https://github.com/hangone/WeBan/releases/latest) 下载文件运行，根据提示输入信息。下载缓慢可以用 [https://gh-proxy.com/](https://gh-proxy.com/) 加速下载。
+
+| 平台 | 下载地址 | 镜像下载地址 |
+|------|---------------|---------------|
+| Windows x64 | [WeBan-windows-x64.exe](https://github.com/hangone/WeBan/releases/latest/download/WeBan-windows-x64.exe) | [WeBan-windows-x64.exe](https://gh-proxy.com/https://github.com/hangone/WeBan/releases/latest/download/WeBan-windows-x64.exe) |
+| Linux x64 | [WeBan-linux-x64](https://github.com/hangone/WeBan/releases/latest/download/WeBan-linux-x64) | [WeBan-linux-x64](https://gh-proxy.com/https://github.com/hangone/WeBan/releases/latest/download/WeBan-linux-x64) |
+| Linux arm64 | [WeBan-linux-arm64](https://github.com/hangone/WeBan/releases/latest/download/WeBan-linux-arm64) | [WeBan-linux-arm64](https://gh-proxy.com/https://github.com/hangone/WeBan/releases/latest/download/WeBan-linux-arm64) |
+| macOS arm64 | [WeBan-macos-arm64](https://github.com/hangone/WeBan/releases/latest/download/WeBan-macos-arm64) | [WeBan-macos-arm64](https://gh-proxy.com/https://github.com/hangone/WeBan/releases/latest/download/WeBan-macos-arm64) |
+| macOS x64 | [WeBan-macos-x64](https://github.com/hangone/WeBan/releases/latest/download/WeBan-macos-x64) | [WeBan-macos-x64](https://gh-proxy.com/https://github.com/hangone/WeBan/releases/latest/download/WeBan-macos-x64) |
+
+### 源码运行
+
+1. 安装 Python 3（建议使用 [uv](https://github.com/astral-sh/uv)）和 Git
+
+2. 克隆本仓库
+
+```bash
+git clone --depth 1 https://github.com/hangone/WeBan
+```
+
+3. 安装依赖
+
+```bash
+pip install -r requirements.txt # 或 uv sync
+```
+
+4. 运行
+
+```bash
+python main.py # 或 uv run main.py
+```
+
+### Docker
+
+提供两种镜像变体：
+
+| 镜像 | Tag | 说明 |
+|------|-----|------|
+| 内置浏览器 | `latest` / `with-browser` / `<版本号>` | 开箱即用 |
+| 轻量镜像 | `without-browser` / `<版本号>-without-browser` | 通过 CDP 连接宿主机浏览器 |
+
+#### 完整镜像（内置浏览器）
+
+```bash
+docker run -it --rm \
+  -v "$PWD/config.toml":/app/config.toml:ro \
+  -v "$PWD/logs":/app/logs \
+  hangyi/weban:latest
+```
+
+#### 轻量镜像（CDP 连接宿主机浏览器）
+
+容器会自动检测 Docker 环境并尝试连接宿主机的 Chrome，无需手动配置 CDP。
+
+**第一步：在宿主机启动 Chrome 远程调试**
+
+打开 Chrome，地址栏输入 `chrome://inspect/#remote-debugging`，勾选 **Allow remote debugging for this browser instance**。
+
+或者直接命令行启动带远程调试的 Chrome：
+
+```bash
+# macOS
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --remote-debugging-port=9222
+
+# Linux
+google-chrome --remote-debugging-port=9222
+
+# Windows
+"C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222
+```
+
+> 参考：[Chrome DevTools: Debug your browser session](https://developer.chrome.com/blog/chrome-devtools-mcp-debug-your-browser-session)
+
+**第二步：运行容器**
+
+```bash
+docker run -it --rm \
+  -v "$PWD/config.toml":/app/config.toml:ro \
+  -v "$PWD/logs":/app/logs \
+  hangyi/weban:without-browser
+```
+
+如需自定义 CDP 地址，可在 `config.toml` 中配置 `cdp_host` 和 `cdp_port`。
+
+### 浏览器检测
+
+程序按以下优先级自动检测可用的浏览器，无需手动配置：
+
+1. **用户指定**：环境变量 `CHROMIUM_BINARY` / 配置文件 `browser_path`
+2. **CDP 远程调试**：配置文件 `cdp_host` + `cdp_port`，或 Docker 环境下自动尝试 `host.docker.internal:9222`
+3. **Playwright 浏览器**：`pip install playwright && playwright install chromium`
+4. **系统浏览器**：自动查找已安装的 Chrome / Chromium
+
+## 演示
+
+![study](images/study.png)
+![exam](images/exam.png)
+![old](images/old.png)
+
+## 常见问题
+
+- ### 部分无法直接登录的学校/Token 登录方法
+
+有些从迎新系统跳转的可以试试账号密码都是学号，也可以尝试使用 Token 登录，在电脑浏览器登录后按 F12 或者 Ctrl+Shift+I 打开开发者工具，找到本地存储，复制 user 的内容到 config.json 配置文件
+
+![chrome](images/chrome.png)
+![firefox](images/firefox.png)
+
+- ### 学习
+
+1. 学习时长太低不会计入进度
+2. 有腾讯云验证码的还不支持自动完成，会弹出浏览器窗口手动操作
+2. 学习进度不更新可能是被风控，遇到了需要验证码的课程，请去网页上完成一次后重试
+
+- ### 考试
+
+
+1. 据观察，考试未提交是不会消耗考试次数的
+
+## 鸣谢
+
+- [Coaixy/weiban-tool](https://github.com/Coaixy/weiban-tool) 提供题库和一些代码思路
+- [pooneyy/WeibanQuestionsBank](https://github.com/pooneyy/WeibanQuestionsBank) 提供题库
+
+## 其他
+
+1. 本项目仅供学习交流使用，请勿用于商业用途，否则后果自负。
+2. 欢迎 Star 喵，欢迎 PR 喵。
+3. 截图时注意打码个人信息。
+4. **如果看不懂上面说的也可以直接扫码备注学校和账号密码（建议留言微信号），乐意效劳。**
+
+   |             微信             |            支付宝            |
+   | :--------------------------: | :--------------------------: |
+   | ![wechat](images/wechat.png) | ![alipay](images/alipay.png) |

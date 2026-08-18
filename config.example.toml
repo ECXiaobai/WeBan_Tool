@@ -1,0 +1,112 @@
+# WeBan 配置文件
+
+# 账号设置
+[[account]]
+# 学校名称（必填，需要和登录页面显示的学校完全一致，推荐复制过来）
+tenant_name = ""
+# 用户名
+username = ""
+# 密码（默认和用户名一样）
+password = ""
+
+# 支持在账号级别覆盖全局设置，例如：
+# 登录方式 2：Token (可选，优先使用，需要登录后在开发控制台获取)
+# tenant_name = ""
+# user_id = ""
+# token = ""
+# 支持在账号级别覆盖全局设置，例如：
+# study_mode = "force"
+
+# 全局设置
+[settings]
+# 学习模式：
+# false = 不学习，跳过所有学习任务
+# true  = 正常学习，默认跳过已完成内容
+# force = 强制学习，已完成内容也会重新学习，全部学完后继续循环
+study_mode = "true"
+
+# 考试模式：
+# false = 不考试，跳过所有考试任务
+# true  = 正常考试，已及格/已完成的考试默认跳过
+# perfect = 达到满分为止，如果只剩一次考试机会且题库无法完全匹配则会停止
+# force = 强制考试，即使已及格也继续参加考试，除非没有考试机会了
+exam_mode = "perfect"
+
+# 遇到题库中没有的题目时是否随机作答：
+# true  = 单选随机，多选全选
+# false = 在终端中等待手动输入答案
+random_answer = true
+
+# 每个学习任务的最少停留时长（秒）
+# 过快不会记录学习进度，数值越大越稳妥，但整体耗时也会越长
+study_time = 30
+
+# 视频课程学习倍速：完课前按 视频时长/倍速 等待，与真人播放行为对齐，降低风控抽检概率
+# 1 = 按视频实际时长等待（默认，最稳妥）
+# 2 = 按视频时长的一半等待（2 倍速播放；实测样本不足，新账号首门课被抽检概率较高，不建议新号使用）
+# 0 = 不等待视频时长，直接按上面的 study_time 学习时长完课
+video_speed = 1
+
+# 对未加载 apicenext.js 的课程是否补发 jupiter 翻页轨迹（默认关闭，完全对齐官方页面行为）
+# 官方前端只有加载 apicenext.js 的课程会调 jupiter 上报轨迹；个别学校
+# 可能要求所有微课都上报，实测不开会 10018 时可设为 true
+# jupiter_fallback = false
+
+# 课程完课验证码模式（合并自 WeibanCourseHelper 的轻量破解技巧）
+# api     = 纯请求固定坐标点选破解（getCaptcha/checkCaptcha，不启动浏览器），
+#           最快但可能被风控（完课验证码弹窗时服务端校验坐标）
+# browser = 启动无头/可见浏览器自动识别，失败转手动（原 WeBan 行为，最稳）
+# auto    = 先尝试 api 破解，失败再回退浏览器（默认，推荐）
+course_captcha_mode = "auto"
+
+# 登录成功后自动模拟打开官方首页（默认开启，无需配置）：对齐网页端请求面，
+# 依次发送 协议/轮播图/项目统计/公告红点/公告列表/功能开关/用户信息/租户配置/
+# 帮助文件/学习任务 等初始化请求，并输出未确认的必读公告后逐条确认
+# （notice/listMust.do + notice/viewMust.do，与浏览器弹窗阅读行为一致）。
+# 任一请求失败只记日志，不影响后续学习流程。
+
+# 每道考试题的答题等待时长（秒）
+# 格式："基础等待时间,随机等待上限"
+exam_question_time = "3,3"
+
+# 允许提交试卷的最低题库匹配率（百分比）
+# 当匹配率低于此值且 random_answer = false 时，程序会放弃交卷
+exam_submit_match_rate = 90
+
+# 多账号并发时允许的最大线程数
+# 实际并发数 = min(账号数, max_workers)
+max_workers = 5
+
+# 浏览器可执行文件路径
+# 留空则自动检测系统中已安装的 Chrome / Chromium / Edge
+# macOS 示例: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+# Windows 示例: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+# Linux 示例: "/usr/bin/google-chrome-stable"
+browser_path = ""
+
+# CDP 远程调试（连接已有浏览器实例，适用于 Docker 等无法直接启动浏览器的场景）
+# 在宿主机启动 Chrome 时加上: chrome --remote-debugging-port=9222
+# 然后填写以下两项，nodriver 将通过 CDP 连接该浏览器，不再启动本地浏览器
+# 注意: cdp_host 和 cdp_port 需同时设置才生效
+# Docker 环境会自动检测，无需手动配置
+cdp_host = ""
+cdp_port = 0
+
+# 是否启用调试日志
+# 开启后会输出更多日志，比如请求体和响应体，验证码图片等
+debug = false
+
+# AI 答题设置
+[ai]
+# 是否启用 AI 搜题功能（当题库无匹配时，优先采用 AI 搜题解答，AI 答题失败将回退到随机答题的配置）
+enable = true
+# API 基础路径，例如 DeepSeek、硅基流动等 OpenAI 兼容接口路径（/chat/completions）
+base_url = "https://opencode.ai/zen/v1"
+# AI 服务的 API Key
+api_key = ""
+# 调用的模型名称，如 deepseek-v4-flash 等
+model = "deepseek-v4-flash-free"
+# 请求超时时间（秒）
+timeout = 60
+# 请求失败时的最大重试次数
+max_retries = 2

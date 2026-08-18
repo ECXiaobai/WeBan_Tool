@@ -1,0 +1,244 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:
+  PYTHONIOENCODING: utf-8
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      app_version: ${{ steps.resolve.outputs.app_version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: resolve
+        shell: bash
+        run: |
+          py_ver=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            # tag 触发：tag 号必须与 pyproject.toml 的 version 一致
+            tag_ver="${GITHUB_REF#refs/tags/v}"
+            if [[ "$tag_ver" != "$py_ver" ]]; then
+              echo "::error::版本不一致：tag ${tag_ver} 与 pyproject.toml ${py_ver} 不符，请对齐后再打 tag" >&2
+              exit 1
+            fi
+            # tag 命中 HEAD 为 3.8.6，tag 后又有提交为 3.8.6-gabcdef
+            app_version=$(git describe --tags --always | sed 's/^v//' | sed 's/-[0-9]*-g/-/')
+          else
+            # 非 tag 触发：用 pyproject.toml 里的静态版本
+            app_version="$py_ver"
+          fi
+
+          echo "app_version=${app_version}" >> "$GITHUB_OUTPUT"
+          echo "产物版本：${app_version}"
+
+  build:
+    name: Build ${{ matrix.os }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, ubuntu-24.04-arm, macos-15-intel, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Inject version
+        shell: bash
+        env:
+          APP_VERSION: ${{ needs.version.outputs.app_version }}
+        run: |
+          python3 - "$APP_VERSION" <<'PY'
+          import re, sys
+          ver = sys.argv[1]
+          p = "pyproject.toml"
+          s = open(p, encoding="utf-8").read()
+          s2, n = re.subn(r'^version = ".*?"', f'version = "{ver}"', s, count=1, flags=re.M)
+          if n != 1:
+              raise SystemExit(f"未在 {p} 中找到 version 字段")
+          open(p, "w", encoding="utf-8").write(s2)
+          print(f"已注入版本 {ver}")
+          PY
+
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
+        with:
+          python-version: "3.12"
+          cache-python: true
+          enable-cache: true
+        env:
+          UV_PYTHON_PREFERENCE: only-managed
+
+      - run: uv sync
+
+      - name: Build executable
+        shell: bash
+        run: |
+          os_name=$(echo "${{ runner.os }}" | tr '[:upper:]' '[:lower:]')
+          arch=$(echo "${{ runner.arch }}" | tr '[:upper:]' '[:lower:]')
+          ext=""
+          [[ "$os_name" == "windows" ]] && ext=".exe"
+          name="WeBan-${os_name}-${arch}${ext}"
+
+          sep=$(python -c "import os; print(os.pathsep)")
+          uv run pyinstaller --noconfirm --onefile \
+            --name "$name" \
+            --add-data "captcha_model.onnx${sep}." \
+            --add-data "answer/answer.json${sep}answer/answer.json" \
+            --add-data "config.example.toml${sep}." \
+            --add-data "pyproject.toml${sep}." \
+            --hidden-import nodriver \
+            --hidden-import loguru \
+            --hidden-import numpy \
+            --hidden-import cv2 \
+            --collect-submodules nodriver \
+            main.py
+
+          echo "name=$name" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.name }}
+          path: dist/${{ env.name }}*
+          if-no-files-found: error
+
+  docker:
+    name: Docker ${{ matrix.variant }} ${{ matrix.platform }}
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [with-browser, without-browser]
+        platform: [linux/amd64, linux/arm64]
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v7
+        id: build
+        with:
+          context: .
+          file: Dockerfile
+          target: ${{ matrix.variant }}
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            APP_VERSION=${{ needs.version.outputs.app_version }}
+          outputs: type=image,name=${{ secrets.DOCKERHUB_USERNAME }}/weban,push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+          cache-from: type=gha,scope=docker-${{ matrix.variant }}-${{ matrix.arch }}
+          cache-to: type=gha,scope=docker-${{ matrix.variant }}-${{ matrix.arch }},mode=max
+
+      - name: Export digest
+        run: echo "${{ steps.build.outputs.digest }}" > digest-${{ matrix.variant }}-${{ matrix.arch }}.txt
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.variant }}-${{ matrix.arch }}
+          path: digest-${{ matrix.variant }}-${{ matrix.arch }}.txt
+
+  docker-merge:
+    name: Docker merge ${{ matrix.variant }}
+    needs: docker
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: without-browser
+            tags: |
+              type=semver,pattern={{version}}-without-browser
+              type=semver,pattern={{major}}.{{minor}}-without-browser
+              type=semver,pattern={{major}}-without-browser
+              type=raw,value=without-browser
+          - variant: with-browser
+            tags: |
+              type=semver,pattern={{version}}
+              type=semver,pattern={{major}}.{{minor}}
+              type=semver,pattern={{major}}
+              type=raw,value=latest
+              type=raw,value=with-browser
+    steps:
+      - uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: digest-${{ matrix.variant }}-*
+          path: digests
+          merge-multiple: true
+
+      - uses: docker/metadata-action@v6
+        id: meta
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/weban
+          flavor: |
+            latest=false
+          tags: ${{ matrix.tags }}
+
+      - name: Create manifest
+        env:
+          IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/weban
+          TAGS: ${{ steps.meta.outputs.tags }}
+          AMD64_DIGEST_FILE: digests/digest-${{ matrix.variant }}-amd64.txt
+          ARM64_DIGEST_FILE: digests/digest-${{ matrix.variant }}-arm64.txt
+        run: |
+          tag_args=()
+          for tag in $TAGS; do
+            tag_args+=("-t" "$tag")
+          done
+
+          docker buildx imagetools create "${tag_args[@]}" \
+            "$IMAGE@$(< "$AMD64_DIGEST_FILE")" \
+            "$IMAGE@$(< "$ARM64_DIGEST_FILE")"
+
+  release:
+    name: Release
+    permissions:
+      contents: write
+    needs: [build, docker, docker-merge]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: WeBan-*
+          path: artifacts
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: artifacts/*
+          generate_release_notes: true
