@@ -13,7 +13,7 @@ from uuid import uuid4
 from loguru import logger
 
 from api import WeBanAPI
-from captcha import CaptchaHandler, LoginCaptchaSolver
+from captcha import CaptchaHandler, LoginCaptchaSolver, is_non_interactive
 
 if getattr(sys, "frozen", False):
     base_path = os.path.dirname(os.path.abspath(sys.executable))
@@ -21,9 +21,17 @@ if getattr(sys, "frozen", False):
 else:
     base_path = os.path.dirname(os.path.abspath(__file__))
     bundle_path = base_path
-answer_dir = os.path.join(base_path, "answer")
+
+# 无交互模式判定复用 captcha.is_non_interactive（ENVIRONMENT=docker / stdin 非 TTY）
+
+# 数据目录模式（main.py --data-dir / WB_DATA_DIR）：answer 也放数据目录，便于挂载持久化
+_data_dir = os.environ.get("WB_DATA_DIR", "")
+if _data_dir:
+    answer_dir = os.path.join(_data_dir, "answer")
+else:
+    answer_dir = os.path.join(base_path, "answer")
 answer_path = os.path.join(answer_dir, "answer.json")
-root_answer_path = os.path.join(base_path, "answer.json")
+root_answer_path = os.path.join(_data_dir, "answer.json") if _data_dir else os.path.join(base_path, "answer.json")
 bundle_answer_path = os.path.join(bundle_path, "answer", "answer.json")
 
 
@@ -609,6 +617,13 @@ class WeBanClient:
                 verify_code = LoginCaptchaSolver.recognize(verify_image, self.log)
                 if not verify_code:
                     continue
+            elif is_non_interactive():
+                # 无交互模式：不阻塞等待手动输入，直接判定失败
+                self.log.error(
+                    "验证码 OCR 连续失败且处于无交互模式，无法手动输入验证码，"
+                    "登录失败（可在宿主机浏览器配合 CDP 或稍后重试）"
+                )
+                break
             else:
                 account_id = (
                     self.api.account or self.api.user.get("userId") or "unknown"
@@ -638,12 +653,102 @@ class WeBanClient:
             break
         return None
 
+    # ---- project list & per-project cycle ----------------------------------
+
+    def _get_project_list(self) -> list[dict]:
+        """获取账号全部进行中的项目列表（含实验室课程合并）"""
+        my_project = self.api.list_my_project()
+        if not _check_code_ok(my_project):
+            self.log.error(f"获取任务列表失败：{my_project}")
+            return []
+        my_project = my_project.get("data", [])
+
+        completion = self.api.list_completion()
+        if not _check_code_ok(completion):
+            self.log.error(f"获取模块完成情况失败：{completion}")
+        else:
+            showable_modules = [
+                d["module"] for d in completion.get("data", []) if d["showable"] == 1
+            ]
+            if "labProject" in showable_modules:
+                self.log.info("加载实验室课程")
+                lab_project = self.api.lab_index()
+                if not _check_code_ok(lab_project):
+                    self.log.error(f"获取实验室课程失败：{lab_project}")
+                current = lab_project.get("data", {}).get("current") or {}
+                if current:
+                    my_project.append(current)
+        return my_project
+
+    def run_project_cycle(
+        self,
+        study_time: str | int,
+        study_mode: str,
+        exam_mode: str,
+        random_answer: bool,
+        exam_question_time: str,
+        exam_submit_match_rate: int,
+    ) -> None:
+        """按项目交替执行：每个项目先完成课程学习，再完成考试，然后
+        切换到下一个项目（用户要求的顺序：项目 A 学习+考试 → 项目 B 学习+考试）。
+
+        考试模式/学习模式为 "false" 时对应阶段整体跳过。
+        """
+        study = study_mode != "false"
+        exam = exam_mode != "false"
+        if not study and not exam:
+            self.log.info("学习与考试均未开启，跳过")
+            return
+
+        if study:
+            mode_desc = {"true": "正常", "force": "强制重新学习"}.get(
+                study_mode, study_mode
+            )
+            self.log.info(f"学习模式: {mode_desc}")
+        if exam:
+            mode_desc = {
+                "true": "正常",
+                "perfect": "追求满分",
+                "force": "强制重考",
+            }.get(exam_mode, exam_mode)
+            self.log.info(f"考试模式: {mode_desc}")
+
+        projects = self._get_project_list()
+        if not projects:
+            self.log.warning("当前没有进行中的项目。")
+            return
+
+        for project in projects:
+            project_name = project.get("projectName", "未知项目")
+            user_project_id = project.get("userProjectId", "")
+            self.log.info(f"===== 开始处理项目：{project_name} =====")
+            if not user_project_id:
+                self.log.warning(f"{project_name}：缺少 userProjectId，跳过")
+                continue
+            if study:
+                self.run_study(study_time, study_mode, only_project=project)
+            if exam:
+                self.run_exam(
+                    exam_mode=exam_mode,
+                    random_answer=random_answer,
+                    exam_question_time=exam_question_time,
+                    exam_submit_match_rate=exam_submit_match_rate,
+                    only_project=project,
+                )
+
     # ---- study --------------------------------------------------------------
 
-    def run_study(self, study_time: str | int, study_mode: str = "true") -> None:
+    def run_study(
+        self,
+        study_time: str | int,
+        study_mode: str = "true",
+        only_project: dict | None = None,
+    ) -> None:
         """主学习流程入口：遍历所有项目 → 分类 → 课程，逐门学习
         :param study_time: 每门课学习时长 "基础时间,随机上限"（秒），如 "20,10"
         :param study_mode: 学习模式，"force" 时忽略完成状态全部重新学习
+        :param only_project: 只学习指定项目（按项目交替调用时传入，含
+            projectName/userProjectId 等字段）；None 时学习全部项目
         """
         # 解析学习时长
         try:
@@ -663,27 +768,12 @@ class WeBanClient:
 
         answers_json = self._load_answers_json(warn_on_fail=True)
 
-        my_project = self.api.list_my_project()
-        if not _check_code_ok(my_project):
-            self.log.error(f"获取任务列表失败：{my_project}")
-            return
-
-        my_project = my_project.get("data", [])
+        if only_project is not None:
+            my_project = [only_project]
+        else:
+            my_project = self._get_project_list()
         if not my_project:
             self.log.warning("当前没有进行中的学习项目。")
-        completion = self.api.list_completion()
-        if not _check_code_ok(completion):
-            self.log.error(f"获取模块完成情况失败：{completion}")
-
-        showable_modules = [
-            d["module"] for d in completion.get("data", []) if d["showable"] == 1
-        ]
-        if "labProject" in showable_modules:
-            self.log.info("加载实验室课程")
-            lab_project = self.api.lab_index()
-            if not _check_code_ok(lab_project):
-                self.log.error(f"获取实验室课程失败：{lab_project}")
-            my_project.append(lab_project.get("data", {}).get("current", {}))
 
         for task in my_project:
             project_prefix = task["projectName"]
@@ -703,7 +793,10 @@ class WeBanClient:
                 raise  # Token 失效，立即终止该账号
             except OSError as e:  # 网络异常不阻断学习
                 self.log.warning(f"初始化学习索引失败（网络异常）：{e}")
-            self.get_progress(task["userProjectId"], project_prefix)
+            progress = self.get_progress(task["userProjectId"], project_prefix)
+            progress_data = (
+                progress.get("data", {}) if _check_code_ok(progress) else {}
+            )
 
             choose_types = [
                 (3, "必修课", "requiredNum", "requiredFinishedNum"),
@@ -711,6 +804,18 @@ class WeBanClient:
                 (2, "自选课", "optionalNum", "optionalFinishedNum"),
             ]
             for choose_type in choose_types:
+                # 只跳过"项目无该类型需求"（需求数=0）的类型：
+                # - need > 0（如项目确实要完成 5 门自选课）→ 正常学习该类型；
+                # - need == 0（未配置该类型，如本例自选课 optionalNum=0）→
+                #   整体跳过，避免把可选课池里未报名的课程当任务学
+                #   （v3.9.8 #147 让自选课可真学，此前会把整个课池学完）
+                need = int(progress_data.get(choose_type[2], 0) or 0)
+                if need <= 0:
+                    self.log.info(
+                        f"{project_prefix} 无{choose_type[1]}需求"
+                        f"（{choose_type[2]}={need}），跳过该类型"
+                    )
+                    continue
                 # 官方 H5 课程主页按项目 projectMode 分流课程列表：
                 # mode==1 折叠分类（listCategory+listCourse）；mode≠1 扁平分页
                 # （listFlatCourse.do）。取不到 mode 时按折叠路径（原行为）兜底。
@@ -774,6 +879,39 @@ class WeBanClient:
                             return
 
             self.log.success(f"{project_prefix} 课程学习完成")
+            self._check_project_course_done(task, project_prefix)
+
+    def _check_project_course_done(
+        self, task: dict, project_prefix: str
+    ) -> None:
+        """校验项目各类型课程完成数是否达到需求数，不足时告警。
+
+        服务端进度更新可能有延迟，因此只告警不重试；覆盖折叠/扁平两种
+        列表路径学完后的盲区（如扁平分页提前结束导致漏学）。
+        """
+        try:
+            progress = self.get_progress(
+                task["userProjectId"], project_prefix, output=False
+            )
+            if not _check_code_ok(progress):
+                return
+            data = progress.get("data", {})
+            for _, label, need_key, finished_key in [
+                (3, "必修课", "requiredNum", "requiredFinishedNum"),
+                (1, "推送课", "pushNum", "pushFinishedNum"),
+                (2, "自选课", "optionalNum", "optionalFinishedNum"),
+            ]:
+                need = int(data.get(need_key, 0) or 0)
+                finished = int(data.get(finished_key, 0) or 0)
+                if need > 0 and finished < need:
+                    self.log.warning(
+                        f"{project_prefix} {label}完成 {finished}/{need}，"
+                        f"未达到需求数，请检查是否漏学"
+                    )
+        except PermissionError:
+            raise  # Token 失效，立即终止该账号
+        except OSError as e:
+            self.log.debug(f"校验学习完成进度失败（网络异常）：{e}")
 
     def _learn_course(
         self,
@@ -847,10 +985,20 @@ class WeBanClient:
         走 listFlatCourse.do 分页列表（平铺渲染，无分类层级）。日志前缀的
         分类名取课程对象的 categoryName（若服务端返回该字段），否则回退到
         tab 名（如"自选课"）；仅用于日志展示，不影响学习逻辑。
+
+        对齐官方前端（app.js loadCourseDataByPage）：pageSize=12、pageNo
+        从 1 递增、`finished = totalPages <= pageNo` 翻到最后一页为止，
+        把全部页的 paginateData 拼接成完整课程列表。**先翻完所有页收集
+        完整列表，再逐门学习**——不能在"边学边翻页"时翻页：listFlatCourse
+        的排序会随课程完成状态变化（未完成优先），学完一页后排序漂移会让
+        原本靠后的未完成课程沉到已翻过的页里，导致漏学（实测 25 门按
+        12/页边学边翻只学到 13 门）。先收集再学则列表在一次翻页窗口内
+        稳定，不会漏。
         """
         label = choose_type[1]
+        page_size = 12  # 与官方前端一致
         page_no = 1
-        page_size = 12
+        courses_all: list[dict] = []
         while True:
             try:
                 res = self.api.list_flat_course(
@@ -865,25 +1013,27 @@ class WeBanClient:
                 self.log.error(f"获取 {label} 课程失败：{res}")
                 return
             data = res.get("data") or {}
-            courses = data.get("paginateData") or []
-            for course in courses:
-                if not force_restudy and int(course.get("finished", 0)) == 1:
-                    continue
-                category_name = course.get("categoryName") or label
-                category_prefix = f"{label} {project_prefix}/{category_name}"
-                if not self._learn_course(
-                    course,
-                    task,
-                    category_prefix,
-                    project_prefix,
-                    answers_json,
-                    force_restudy,
-                ):
-                    return
+            courses_all.extend(data.get("paginateData") or [])
             total_pages = int(data.get("totalPages", 1) or 1)
-            if page_no >= total_pages:
+            # 官方结束条件：totalPages <= pageNo
+            if total_pages <= page_no:
                 break
             page_no += 1
+
+        for course in courses_all:
+            if not force_restudy and int(course.get("finished", 0)) == 1:
+                continue
+            category_name = course.get("categoryName") or label
+            category_prefix = f"{label} {project_prefix}/{category_name}"
+            if not self._learn_course(
+                course,
+                task,
+                category_prefix,
+                project_prefix,
+                answers_json,
+                force_restudy,
+            ):
+                return
 
     @staticmethod
     def _is_account_blocked(res: dict) -> bool:
@@ -1013,16 +1163,16 @@ jupiter_fallback=true 时也补翻页轨迹。再答题，最后完课。
                 if qlist:
                     self.log.info(f"  {label} {len(qlist)} 道")
                     for i, q in enumerate(qlist):
-                        hit = self._answer_question(
+                        # 无论题库命中还是 fallback 都已提交答案，
+                        # 对用户而言课程题目作答流程已完成
+                        self._answer_question(
                             q,
                             answers_json,
                             course["resourceId"],
                             save_func,
                             source_str,
                         )
-                        self.log.info(
-                            f"    {i + 1}/{len(qlist)} {'✓' if hit else '未命中'}"
-                        )
+                        self.log.info(f"    {i + 1}/{len(qlist)} 已完成")
                         time.sleep(0.5)
         elif question_data:
             self.log.info(f"  list_question: code={question_data.get('code')}")
@@ -1191,6 +1341,7 @@ jupiter_fallback=true 时也补翻页轨迹。再答题，最后完课。
         random_answer: bool = True,
         exam_question_time: str = "3,3",
         exam_submit_match_rate: int = 90,
+        only_project: dict | None = None,
     ):
         """考试主入口
 
@@ -1205,6 +1356,8 @@ jupiter_fallback=true 时也补翻页轨迹。再答题，最后完课。
         :param random_answer: True=单选随机多选全选，False=终端手动输入
         :param exam_question_time: 每道题答题等待时长 "基础时间,随机上限"（秒）
         :param exam_submit_match_rate: 允许提交的最低题库匹配率（%）
+        :param only_project: 只考试指定项目（按项目交替调用时传入）；
+            None 时考试全部项目
         """
         # 解析每题等待时间
         try:
@@ -1218,27 +1371,12 @@ jupiter_fallback=true 时也补翻页轨迹。再答题，最后完课。
 
         answers_json = self._load_answers_json()
 
-        projects = self.api.list_my_project()
-        if not _check_code_ok(projects):
-            self.log.error(f"获取考试列表失败：{projects}")
-            return
-        projects = projects.get("data", [])
+        if only_project is not None:
+            projects = [only_project]
+        else:
+            projects = self._get_project_list()
         if not projects:
             self.log.warning("当前没有进行中的项目可考试。")
-
-        completion = self.api.list_completion()
-        if not _check_code_ok(completion):
-            self.log.error(f"获取模块完成情况失败：{completion}")
-
-        showable_modules = [
-            d["module"] for d in completion.get("data", []) if d["showable"] == 1
-        ]
-        if "labProject" in showable_modules:
-            self.log.info("加载实验室课程")
-            lab_project = self.api.lab_index()
-            if not _check_code_ok(lab_project):
-                self.log.error(f"获取实验室课程失败：{lab_project}")
-            projects.append(lab_project.get("data", {}).get("current", {}))
 
         for project in projects:
             # 项目未开始（未到开课时间等）：官方 H5 弹 message 并禁止进入，同样提示后跳过
@@ -1275,8 +1413,12 @@ jupiter_fallback=true 时也补翻页轨迹。再答题，最后完课。
                     except OSError:
                         pass
                     self.log.info(
-                        f"{plan_name} 已考过 {exam_finish_num} 次，"
+                        f"{plan_name} 已考过 {exam_finish_num}/{exam_odd_num} 次，"
                         f"最高 {exam_score}/{full_score}（及格线 {pass_score}）"
+                    )
+                elif exam_odd_num > 0:
+                    self.log.info(
+                        f"{plan_name} 未考试，可考 {exam_odd_num} 次"
                     )
 
                 # ── 根据 exam_mode 判断是否跳过 ──
@@ -1323,7 +1465,13 @@ jupiter_fallback=true 时也补翻页轨迹。再答题，最后完课。
 
                 prepare_paper = self.api.exam_prepare_paper(user_exam_plan_id)
                 if not _check_code_ok(prepare_paper):
-                    self.log.error(f"获取考试信息失败：{prepare_paper}")
+                    if prepare_paper.get("detailCode") == "14":
+                        self.log.warning(
+                            f"{plan_name} 课程学习未完成，无法考试；"
+                            f"请先完成该项目的课程学习"
+                        )
+                    else:
+                        self.log.error(f"获取考试信息失败：{prepare_paper}")
                     continue
                 prepare_paper = prepare_paper["data"]
                 question_num = prepare_paper["questionNum"]
@@ -1418,8 +1566,10 @@ jupiter_fallback=true 时也补翻页轨迹。再答题，最后完课。
                             f"{question['title'][:40]}..."
                         )
                         time.sleep(use_time)
-                    elif random_answer:
+                    elif random_answer or is_non_interactive():
                         # 自动随机作答：单选随机选一个，多选全选
+                        # （无交互模式即使配置 random_answer=false 也走随机，
+                        #   避免阻塞等待终端输入）
                         answers_ids = self._auto_select_answer(question)
                         use_time = question_base_time + randint(
                             0, question_random_upper

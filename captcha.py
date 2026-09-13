@@ -11,9 +11,7 @@
 """
 
 import asyncio
-import gc
 import json
-import logging
 import os
 import platform
 import random
@@ -21,7 +19,6 @@ import shutil
 import sys
 import threading
 import time
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -31,6 +28,28 @@ import numpy as np
 import requests
 from nodriver import cdp
 from nodriver.cdp.runtime import DeepSerializedValue
+
+# 限制 OpenCV 线程数（默认 1）：1-2 核小服务器上，验证码识别（OpenCV
+# 全核多线程）与 headless-shell 渲染并发会把 CPU 抢满，CDP 命令被饿死
+# （实测 2 核机器每步从 4s 拖到 55s）。1 线程对识别耗时影响小（单张图
+# 也就几秒），但能保证 headless-shell 有 CPU 可用。WB_CV_THREADS 可覆盖。
+cv2.setNumThreads(int(os.environ.get("WB_CV_THREADS", "1") or 1))
+
+
+# 无交互模式判定（client/main 共用，放本模块避免循环导入）：
+# - ENVIRONMENT=docker（或 container）：Dockerfile 默认设置，标识容器环境
+# - stdin 非 TTY：cron/后台运行/管道/SSH 无 TTY 会话，无法接收输入
+# - 显式 CLI --non-interactive 由 main.py 单独叠加
+def is_non_interactive() -> bool:
+    env = os.environ.get("ENVIRONMENT", "").strip().lower()
+    if env in ("docker", "container"):
+        return True
+    try:
+        if not sys.stdin.isatty():
+            return True
+    except (AttributeError, ValueError):
+        return True
+    return False
 
 
 def _dsv_to_py(dsv):
@@ -53,36 +72,6 @@ def _dsv_to_py(dsv):
     return dsv
 
 
-@contextmanager
-def _suppress_asyncio_childwatcher():
-    """抑制 asyncio 在事件循环关闭后的子进程相关警告和异常。
-
-    asyncio.run() 关闭循环后，子进程 transport 和 child watcher 回调
-    在 GC 阶段触发，此时循环已关闭。需要在 GC 完成后再恢复日志级别。
-    """
-    import atexit
-    from asyncio.base_subprocess import BaseSubprocessTransport
-
-    logger = logging.getLogger("asyncio")
-    prev = logger.level
-    logger.setLevel(logging.CRITICAL)
-    try:
-        yield
-    finally:
-        gc.collect()
-        time.sleep(0.1)
-        gc.collect()
-        logger.setLevel(prev)
-        # 程序退出时 patch transport 析构，抑制 "Event loop is closed" 异常
-        _orig_del = BaseSubprocessTransport.__del__
-
-        def _safe_del(self):
-            try:
-                _orig_del(self)
-            except RuntimeError:
-                pass
-
-        atexit.register(setattr, BaseSubprocessTransport, "__del__", _safe_del)
 
 
 # 腾讯验证码 SDK 地址
@@ -187,7 +176,7 @@ def rotate_mask(mask: np.ndarray, angle: float) -> np.ndarray:
     h, w = mask.shape
     center = (w / 2, h / 2)
     matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
-    return cv2.warpAffine(mask, matrix, (w, h), flags=cv2.INTER_NEAREST, borderValue=0)
+    return cv2.warpAffine(mask, matrix, (w, h), flags=cv2.INTER_NEAREST, borderValue=(0,))
 
 
 def crop_foreground(mask: np.ndarray) -> np.ndarray | None:
@@ -225,7 +214,8 @@ def match_cost(
     if not allow_rotate:
         return best
 
-    for angle in (-60, -45, -30, -20, -10, 10, 20, 30, 45, 60, 90, -90):
+    # 覆盖常见旋转的 6 个角度（原 12 个；小服务器 CPU 敏感，减半提速）
+    for angle in (-60, -30, -10, 10, 30, 60):
         rotated = rotate_mask(query, angle)
         score = float(np.sum(cv2.absdiff(rotated, candidate)) / 255.0)
         best = min(best, score)
@@ -259,8 +249,10 @@ def locate_with_template(
 
     best_score = -1.0
     best_center = None
-    scales = np.linspace(1.1, 3.4, 16)
-    angles = range(-90, 91, 10)
+    # 尺度 16→12、角度 19→13：全图 matchTemplate 是识别耗时主体，
+    # 小服务器上 304 次大图匹配会抢占 CPU，降采样后仍保持足够精度
+    scales = np.linspace(1.1, 3.4, 12)
+    angles = range(-90, 91, 15)
 
     for scale in scales:
         new_w = max(8, round(qw * scale))
@@ -772,6 +764,46 @@ def detect_browser() -> str | None:
     return None
 
 
+async def kill_stray_browsers() -> None:
+    """关闭 nodriver 残留实例，并在事件循环关闭前回收子进程 transport。"""
+    from nodriver.core import util as _nd_util
+
+    instances = list(_nd_util.get_registered_instances())
+    for inst in instances:
+        proc = getattr(inst, "_process", None)
+        try:
+            await asyncio.wait_for(inst.aclose(), timeout=5)
+        except (Exception, asyncio.CancelledError):  # noqa: BLE001
+            await asyncio.sleep(0)
+        try:
+            if proc is not None:
+                if proc.returncode is None:
+                    try:
+                        proc.kill()
+                    except (ProcessLookupError, OSError):
+                        await asyncio.sleep(0)
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except (Exception, asyncio.CancelledError):  # noqa: BLE001
+                    await asyncio.sleep(0)
+        finally:
+            # Process.wait() 只等待子进程退出，不保证 stdout/stderr pipe
+            # transport 已关闭；显式关闭它，避免 asyncio.run() 收尾后由
+            # BaseSubprocessTransport.__del__ 在已关闭 loop 上补清理。
+            transport = getattr(proc, "_transport", None)
+            if transport is not None:
+                try:
+                    transport.close()
+                except (Exception, asyncio.CancelledError):  # noqa: BLE001
+                    await asyncio.sleep(0)
+        config = getattr(inst, "config", None)
+        if config is not None and not config.uses_custom_data_dir:
+            shutil.rmtree(config.user_data_dir, ignore_errors=True)
+    for _ in range(3):
+        await asyncio.sleep(0)
+    _nd_util.get_registered_instances().difference_update(instances)
+
+
 def check_browser_health(
     browser_path: str | None = None,
     cdp_host: str | None = None,
@@ -785,15 +817,12 @@ def check_browser_health(
     :return: 浏览器路径或 CDP 地址
     :raises RuntimeError: 无可用浏览器时
     """
-    # 1. CDP 远程调试
     if cdp_host and cdp_port:
         return f"{cdp_host}:{cdp_port}"
 
-    # 2. 配置文件指定的浏览器路径
     if browser_path and os.path.isfile(browser_path):
         resolved = browser_path
     else:
-        # 3. 自动检测
         resolved = detect_browser()
         if not resolved:
             raise RuntimeError(
@@ -804,31 +833,34 @@ def check_browser_health(
                 "  4. 安装 Chrome、Chromium 或 Edge"
             )
 
-    # 4. 健康探测：让 nodriver 自己拉起一次再停掉。临时 profile、端口分配、
-    #    退出清理全部由库自动处理，也不会撞上用户已打开的 Chrome 单例锁。
+    # 健康探测也必须在同一个事件循环内完成浏览器进程和 pipe transport
+    # 的清理；nodriver.start() 连接失败时可能已启动但未返回 Browser。
     async def _probe() -> None:
-        browser = await nodriver.start(
-            headless=True,
-            browser_executable_path=resolved,
-        )
         try:
+            browser = await nodriver.start(
+                headless=True,
+                browser_executable_path=resolved,
+            )
             await browser.get("data:text/html,<h1>ok</h1>")
         finally:
-            await browser.aclose()
-            proc = browser._process
-            browser.stop()
-            if proc is not None:
-                await asyncio.wait_for(proc.wait(), timeout=5)
+            await kill_stray_browsers()
 
-    try:
-        asyncio.run(asyncio.wait_for(_probe(), timeout=15))
-    except FileNotFoundError as e:
-        raise RuntimeError(f"浏览器可执行文件不存在: {resolved}") from e
-    except TimeoutError:
-        raise RuntimeError(f"浏览器启动超时: {resolved}") from None
-    except Exception as e:
-        raise RuntimeError(f"浏览器启动失败: {e}") from e
-    return resolved
+    last_exc: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            asyncio.run(asyncio.wait_for(_probe(), timeout=20))
+            return resolved
+        except FileNotFoundError as e:
+            raise RuntimeError(f"浏览器可执行文件不存在: {resolved}") from e
+        except TimeoutError as e:
+            last_exc = e
+        except Exception as e:  # noqa: BLE001 -- 探测任何启动失败都要重试
+            last_exc = e
+        if attempt < 3:
+            time.sleep(1)
+    if isinstance(last_exc, TimeoutError):
+        raise RuntimeError(f"浏览器启动超时: {resolved}") from last_exc  # noqa: TRY004
+    raise RuntimeError(f"浏览器启动失败: {last_exc}") from last_exc
 
 
 # ── CaptchaHandler ────────────────────────────────────
@@ -911,31 +943,45 @@ class CaptchaHandler:
         ]
         if headless:
             browser_args.append("--headless=new")
-        try:
-            return await nodriver.start(
-                headless=headless,
-                browser_executable_path=browser_path or None,
-                browser_args=browser_args,
-                host=self.cdp_host,
-                port=self.cdp_port,
-            )
-        except Exception as e:
-            if "Failed to connect to browser" in str(e):
-                if self.cdp_host and self.cdp_port:
+        # 非 CDP 模式：nodriver 启动 Chrome 的就绪窗口只有 ~2.75s，冷启动/
+        # 资源紧张时可能超时（"Failed to connect to browser"），重试一次。
+        # CDP 模式连已有浏览器，失败是配置问题，不重试。
+        attempts = 1 if (self.cdp_host and self.cdp_port) else 2
+        last_exc: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return await nodriver.start(
+                    headless=headless,
+                    browser_executable_path=browser_path or None,
+                    browser_args=browser_args,
+                    host=self.cdp_host,
+                    port=self.cdp_port,
+                )
+            except Exception as e:
+                last_exc = e
+                if "Failed to connect to browser" in str(e):
+                    if self.cdp_host and self.cdp_port:
+                        raise RuntimeError(
+                            f"无法连接 CDP 浏览器 ({self.cdp_host}:{self.cdp_port})。"
+                            "请检查：\n"
+                            "  1. 远程浏览器是否已启动并开放调试端口\n"
+                            "  2. config.toml 中 cdp_host 和 cdp_port 是否正确"
+                        ) from e
+                    # nodriver 失败不清理已启动的 Chrome 子进程，清理后重试
+                    await kill_stray_browsers()
+                    if attempt < attempts:
+                        await asyncio.sleep(1)
+                        continue
                     raise RuntimeError(
-                        f"无法连接 CDP 浏览器 ({self.cdp_host}:{self.cdp_port})。"
-                        "请检查：\n"
-                        "  1. 远程浏览器是否已启动并开放调试端口\n"
-                        "  2. config.toml 中 cdp_host 和 cdp_port 是否正确"
+                        f"无法启动浏览器 ({browser_path or '自动检测'})。"
+                        "请尝试以下解决方案：\n"
+                        "  1. 在 config.toml 中配置 browser_path 指定浏览器路径\n"
+                        "  2. 在 config.toml 中配置 cdp_host 和 cdp_port 连接远程浏览器\n"
+                        "  3. 安装最新版 Chrome 或 Chromium"
                     ) from e
-                raise RuntimeError(
-                    f"无法启动浏览器 ({browser_path or '自动检测'})。"
-                    "请尝试以下解决方案：\n"
-                    "  1. 在 config.toml 中配置 browser_path 指定浏览器路径\n"
-                    "  2. 在 config.toml 中配置 cdp_host 和 cdp_port 连接远程浏览器\n"
-                    "  3. 安装最新版 Chrome 或 Chromium"
-                ) from e
-            raise
+                # 非连接类异常：不重试，直接抛
+                raise
+        raise RuntimeError(f"无法启动浏览器: {last_exc}")
 
     async def _inject_auth(self, tab) -> None:
         """向页面注入 localStorage 认证信息。
@@ -984,13 +1030,21 @@ class CaptchaHandler:
         browser = await asyncio.wait_for(self._create_browser(headless), timeout=30)
         try:
             origin = entry_url.split("#")[0].rstrip("/")
+            # CDP 模式（连已有 headless-shell/Chrome）：浏览器可能没有默认
+            # page target（headless-shell 刚启动时 /json 为空），browser.get()
+            # 会因 next(filter(...)) 无 page target 抛异常，必须 new_tab 创建。
+            cdp_mode = bool(self.cdp_host and self.cdp_port)
             try:
-                tab = await asyncio.wait_for(browser.get(f"{origin}/"), timeout=30)
+                tab = await asyncio.wait_for(
+                    browser.get(f"{origin}/", new_tab=cdp_mode), timeout=30
+                )
             except RuntimeError:
-                if not (self.cdp_host and self.cdp_port):
+                if not cdp_mode:
                     raise
-                # CDP 模式下浏览器初始无页面，创建新标签页
-                tab = await asyncio.wait_for(browser.get(f"{origin}/", new_tab=True), timeout=30)
+                # CDP 模式下 new_tab 仍失败则再试一次（可能 target 已存在）
+                tab = await asyncio.wait_for(
+                    browser.get(f"{origin}/", new_tab=True), timeout=30
+                )
             await self._inject_auth(tab)
             self.log.info("正在加载入口页面")
             await asyncio.wait_for(tab.get(entry_url), timeout=30)
@@ -1083,6 +1137,11 @@ class CaptchaHandler:
         ):
             return None
         if not s.get("bgRect"):
+            return None
+        # 弹窗有"淡入"动画：元素刚挂载时 getBoundingClientRect 可能返回
+        # 负坐标（在视口外），此时点击坐标全错。视为未就绪，等动画完成。
+        br = s["bgRect"]
+        if br.get("x", 0) < 0 or br.get("y", 0) < 0:
             return None
         return s
 
@@ -1232,23 +1291,32 @@ class CaptchaHandler:
     # ── 公开方法 ────────────────────────────────────────
 
     async def _quit_browser(self, browser: nodriver.Browser, label: str = "") -> None:
-        """完整关闭浏览器：websocket 与 Chrome 进程都在事件循环关闭前回收。
-
-        nodriver 的 stop() 用 create_task 排队 aclose 不等待，在 asyncio.run /
-        probe_loop 结束时从未完整执行，导致 listener/socket/子进程 transport
-        泄漏，退出时 GC 报 "Event loop is closed"/ESRCH 噪音。这里先 await
-        公开的 aclose() 关 websocket，再 stop() 终止进程，最后 wait() 回收
-        子进程 transport。
-
-        :param browser: nodriver Browser 实例
-        :param label: 日志标签 (如 "无感验证码"、"自动识别"、"手动验证")
-        """
+        """关闭 websocket、Chrome 进程和 asyncio subprocess transport。"""
+        proc = getattr(browser, "_process", None)
+        transport = getattr(proc, "_transport", None) if proc is not None else None
         try:
-            await browser.aclose()  # 关闭 websocket（取消 listener、关 socket）
-            proc = browser._process  # stop() 会置 None，先捕获
-            browser.stop()  # 终止 Chrome 进程（其内部排队的 aclose 幂等无害）
-            if proc is not None:
-                await asyncio.wait_for(proc.wait(), timeout=5)  # 回收 transport
+            try:
+                await browser.aclose()
+            finally:
+                if proc is not None:
+                    try:
+                        if proc.returncode is None:
+                            proc.kill()
+                        await asyncio.wait_for(proc.wait(), timeout=5)
+                    except (Exception, asyncio.CancelledError):  # noqa: BLE001
+                        await asyncio.sleep(0)
+                    if transport is not None:
+                        try:
+                            transport.close()
+                        except (Exception, asyncio.CancelledError):  # noqa: BLE001
+                            await asyncio.sleep(0)
+                    for _ in range(3):
+                        await asyncio.sleep(0)
+                from nodriver.core import util as _nd_util
+                _nd_util.get_registered_instances().discard(browser)
+                config = getattr(browser, "config", None)
+                if config is not None and not config.uses_custom_data_dir:
+                    shutil.rmtree(config.user_data_dir, ignore_errors=True)
             if label:
                 self.log.info(f"已关闭浏览器 ({label})")
         except Exception as exc:  # noqa: BLE001 -- nodriver 停止浏览器可能抛任意异常
@@ -1267,8 +1335,7 @@ class CaptchaHandler:
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            with _suppress_asyncio_childwatcher():
-                return asyncio.run(self.handle_exam_captcha_async(user_exam_plan_id))
+            return asyncio.run(self.handle_exam_captcha_async(user_exam_plan_id))
         raise RuntimeError(
             "handle_exam_captcha() 无法在已运行的事件循环中调用，请改用 handle_exam_captcha_async()"
         )
@@ -1297,8 +1364,7 @@ class CaptchaHandler:
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            with _suppress_asyncio_childwatcher():
-                return asyncio.run(self.handle_course_captcha_async(course_url))
+            return asyncio.run(self.handle_course_captcha_async(course_url))
         raise RuntimeError(
             "handle_course_captcha() 无法在已运行的事件循环中调用，请改用 handle_course_captcha_async()"
         )
@@ -1312,8 +1378,13 @@ class CaptchaHandler:
         全部失败后才转手动。
         """
         entry_url = course_url or COURSE_ENTRY_URL
-        max_auto_rounds = 3
-        attempts_per_round = 6
+        # 自动识别重试上限（环境变量可调，小核服务器每次尝试很慢）：
+        # WB_CAPTCHA_ROUNDS 轮数、WB_CAPTCHA_ATTEMPTS 每轮次数。
+        # 默认 2 轮 x 3 次（最多 6 次尝试）——实测单次尝试在 1 核机器约
+        # 4 分钟，18 次全试可能 1 小时+；识别成功率高时 1-2 次即过，
+        # 失败应尽快跳过该课程而不是无限重试。
+        max_auto_rounds = int(os.environ.get("WB_CAPTCHA_ROUNDS", "2"))
+        attempts_per_round = int(os.environ.get("WB_CAPTCHA_ATTEMPTS", "3"))
 
         # 第一阶段: 无头自动识别
         self.log.info("正在自动识别验证码...")
@@ -1351,6 +1422,14 @@ class CaptchaHandler:
         if last_exc is not None:
             self.log.warning(f"自动识别曾发生异常，将回退到手动: {last_exc}")
         await asyncio.sleep(1)  # 等待无头浏览器进程完全退出
+
+        # 无交互模式（Docker 等无终端环境）：不打开可见浏览器等待手动，
+        # 直接抛异常让上层跳过该课程
+        if is_non_interactive():
+            raise RuntimeError(
+                "验证码自动识别连续失败且处于无交互模式，"
+                "无法手动完成验证，已跳过该课程"
+            )
 
         # 第二阶段: 打开可见浏览器，让用户手动完成
         self.log.info("=" * 50)
