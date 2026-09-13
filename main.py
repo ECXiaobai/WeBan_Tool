@@ -512,6 +512,63 @@ def save_interactive_account(account: dict) -> None:
 # ── 配置加载 ──────────────────────────────────────────────
 
 
+def _toml_decode_position(err: Exception) -> tuple[int, int]:
+    """从 tomllib.TOMLDecodeError 消息里提取 (行号, 列号)。
+
+    TOMLDecodeError 继承 ValueError，行号/列号只嵌在消息文本里
+    （"(at line N, column M)"），没有独立属性。
+    """
+    m = re.search(r"\(at line (\d+), column (\d+)\)", str(err))
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return 0, 0
+
+
+def _load_config_file(path: str) -> dict:
+    """解析 config.toml；TOML 语法错误时显示出错行内容，交互模式下
+    修复后自动重试（不弹外部编辑器，避免中文系统记事本编码问题）。"""
+    while True:
+        try:
+            with open(path, "rb") as f:
+                return tomllib.load(f)
+        except tomllib.TOMLDecodeError as e:
+            line_no, col = _toml_decode_position(e)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                ctx = (
+                    "".join(lines[max(0, line_no - 2) : line_no + 1])
+                    if 0 < line_no <= len(lines)
+                    else ""
+                )
+            except OSError:
+                ctx = ""
+            logger.error(f"配置文件解析失败: {path}")
+            logger.error(f"  {e}（第 {line_no} 行，第 {col} 列）")
+            if ctx:
+                logger.error(f"  出错位置: 第 {line_no} 行附近")
+                for i, line in enumerate(
+                    ctx.rstrip("\n").splitlines(), start=max(1, line_no - 1)
+                ):
+                    marker = ">>" if i == line_no else "  "
+                    logger.error(f"  {marker}{i:>4} | {line}")
+            logger.error(
+                "  常见原因：引号不配对、值没加引号、中文逗号/中文引号、"
+                "粘贴时多出空格或 BOM 头"
+            )
+            if NON_INTERACTIVE:
+                logger.error("  无交互模式无法修复，请手动修正配置文件后重试")
+                sys.exit(1)
+            logger.warning(f"  请用文本编辑器（记事本/VSCode）打开 {path} 修复后保存")
+            logger.warning("  保存后按回车重新读取（输入 q 退出）...")
+            try:
+                choice = input("> ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                sys.exit(1)
+            if choice in ("q", "quit", "exit"):
+                sys.exit(1)
+
+
 def load_config() -> dict:
     """加载 config.toml，不存在时按模式处理：
     - 无交互模式：下载/创建模板但不打开编辑器（容器/后台）
@@ -552,14 +609,12 @@ def load_config() -> dict:
                 "已创建空配置模板，请在挂载的数据目录中填写账号信息后重试"
             )
             # 重新加载
-            with open(config_path, "rb") as f:
-                return tomllib.load(f)
+            return _load_config_file(config_path)
         else:
             logger.error("无法创建配置文件")
             sys.exit(1)
 
-    with open(config_path, "rb") as f:
-        return tomllib.load(f)
+    return _load_config_file(config_path)
 
 
 # ── 账号级日志过滤器 ─────────────────────────────────────────
