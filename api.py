@@ -88,10 +88,14 @@ class LoggingSession:
             if not content_type or not content_type.lower().startswith(
                 ("text/", "application/json", "application/javascript")
             ):
+                # 二进制响应（视频等）：绝不访问 response.content——
+                # stream 模式下这会触发整个文件的下载，大视频会卡死。
+                # 只记录状态码与 Content-Length 头。
+                content_length = response.headers.get("Content-Length", "unknown")
                 self.log.debug(
                     f"{method} {url} | status={response.status_code} | "
                     f"content-type={content_type or 'unknown'} | "
-                    f"body={len(response.content)} bytes (binary, skipped)"
+                    f"body={content_length} bytes (binary, skipped)"
                 )
             else:
                 self.log.debug(

@@ -1593,40 +1593,71 @@ jupiter_fallback=true 时也补翻页轨迹。再答题，最后完课。
                 video_duration = 0.0
                 try:
                     if video_url.endswith(".m3u8") or "/m3u8/" in video_url:
-                        # m3u8：累加 EXTINF 时长
-                        playlist = self.api.session.get(video_url, timeout=10)
-                        if playlist.status_code == 200:
-                            segments = re.findall(
-                                r"#EXTINF:\s*([0-9]+(?:\.[0-9]+)?)",
-                                playlist.text,
+                        # m3u8：累加 EXTINF 时长。
+                        # stream=True + 限读：异常响应（如服务器把整个视频
+                        # 当 m3u8 返回）不会导致全量下载卡死
+                        def _fetch_playlist(url) -> str:
+                            resp = self.api.session.get(url, timeout=10, stream=True)
+                            if resp.status_code != 200:
+                                resp.close()
+                                return ""
+                            try:
+                                if resp.raw is not None:
+                                    resp.raw.decode_content = True
+                                    data = resp.raw.read(2 * 1024 * 1024)
+                                    return data.decode("utf-8", errors="replace")
+                            except OSError:
+                                pass
+                            finally:
+                                resp.close()
+                            return ""
+
+                        playlist_text = _fetch_playlist(video_url)
+                        segments = re.findall(
+                            r"#EXTINF:\s*([0-9]+(?:\.[0-9]+)?)",
+                            playlist_text,
+                        )
+                        if not segments:
+                            variant = re.search(
+                                r"#EXT-X-STREAM-INF:[^\n]*\n\s*(\S+)",
+                                playlist_text,
                             )
-                            if not segments:
-                                variant = re.search(
-                                    r"#EXT-X-STREAM-INF:[^\n]*\n\s*(\S+)",
-                                    playlist.text,
+                            if variant:
+                                segments = re.findall(
+                                    r"#EXTINF:\s*([0-9]+(?:\.[0-9]+)?)",
+                                    _fetch_playlist(
+                                        urljoin(video_url, variant.group(1))
+                                    ),
                                 )
-                                if variant:
-                                    playlist = self.api.session.get(
-                                        urljoin(video_url, variant.group(1)),
-                                        timeout=10,
-                                    )
-                                    if playlist.status_code == 200:
-                                        segments = re.findall(
-                                            r"#EXTINF:\s*([0-9]+(?:\.[0-9]+)?)",
-                                            playlist.text,
-                                        )
-                            video_duration = sum(float(s) for s in segments)
+                        video_duration = sum(float(s) for s in segments)
                     else:
-                        # mp4：Range 抓文件头/尾各 512KB，解析 moov 内 mvhd
+                        # mp4：Range 抓文件头/尾各 512KB，解析 moov 内 mvhd。
+                        # 请求必须 stream=True 且只读所需字节：部分视频服务器
+                        # 忽略 Range 头返回 200 全量，若交给 requests 完整下载，
+                        # 大视频会长时间卡死（表现为"带视频的课程刷不了"）
                         head_size = 512 * 1024
+
+                        def _read_limited(resp, limit):
+                            """从 stream 响应中只读取至多 limit 字节后关闭连接"""
+                            try:
+                                if resp.raw is not None:
+                                    resp.raw.decode_content = True
+                                    return resp.raw.read(limit)
+                            except OSError:
+                                pass
+                            finally:
+                                resp.close()
+                            return b""
+
                         head = self.api.session.get(
                             video_url,
                             headers={"Range": f"bytes=0-{head_size - 1}"},
                             timeout=10,
+                            stream=True,
                         )
                         buffers: list[bytes] = []
                         if head.status_code in (200, 206):
-                            buffers.append(head.content[:head_size])
+                            buffers.append(_read_limited(head, head_size))
                             if head.status_code == 206:
                                 match = re.search(
                                     r"/(\d+)\s*$",
@@ -1644,9 +1675,16 @@ jupiter_fallback=true 时也补翻页轨迹。再答题，最后完课。
                                                 )
                                             },
                                             timeout=10,
+                                            stream=True,
                                         )
                                         if tail.status_code == 206:
-                                            buffers.append(tail.content)
+                                            buffers.append(
+                                                _read_limited(tail, head_size)
+                                            )
+                                        else:
+                                            tail.close()
+                        else:
+                            head.close()
                         for buf in buffers:
                             pos = 0
                             while pos + 8 <= len(buf) and not video_duration:
